@@ -383,7 +383,7 @@ Your capabilities:
 Guidelines:
 - Always use the available tools to answer questions — never guess or make up email content.
 - When a search or attachment download might take a moment, let the user know briefly (e.g. "Let me look that up" or "Let me read that attachment, it might take a moment").
-- Keep responses concise and conversational since they will be spoken aloud.
+- Keep responses short — aim for 1-3 sentences unless the user asks for more detail or the question requires a longer answer. Your responses will be spoken aloud.
 - When summarizing emails, mention the sender, subject, and key points.
 - IMPORTANT: You CAN read attachment contents. When the user asks about an attachment (PDF, text file, image, etc.), you MUST use the read_attachment tool to fetch and read it. First use read_email to get the attachment_id, then call read_attachment with the message_id and attachment_id. Never tell the user you cannot open or read attachments — you can.
 
@@ -399,86 +399,27 @@ function sendSSE(res: NextApiResponse, data: Record<string, unknown>) {
 }
 
 /**
- * Stream the final text response from OpenAI as SSE delta events.
- * Returns the full accumulated reply text.
+ * Stream a text-only response from OpenAI as SSE delta events.
+ * Used only for the final response after all tool calls are resolved.
  */
-async function streamFinalResponse(
+async function streamTextResponse(
   messages: ChatCompletionMessageParam[],
-  res: NextApiResponse,
-  includTools: boolean
+  res: NextApiResponse
 ): Promise<string> {
   const stream = await openai.chat.completions.create({
     model: "gpt-4o",
     messages,
-    ...(includTools && tools.length > 0 && { tools }),
     stream: true,
   });
 
   let fullReply = "";
-  // Accumulate tool call deltas in case the model decides to call tools
-  const toolCallAccum: Record<number, { id: string; name: string; args: string }> = {};
-  let hasToolCalls = false;
 
   for await (const chunk of stream) {
     const delta = chunk.choices[0]?.delta;
-    if (!delta) continue;
-
-    // Text content delta
-    if (delta.content) {
+    if (delta?.content) {
       fullReply += delta.content;
       sendSSE(res, { delta: delta.content });
     }
-
-    // Tool call deltas — accumulate them
-    if (delta.tool_calls) {
-      hasToolCalls = true;
-      for (const tc of delta.tool_calls) {
-        if (!toolCallAccum[tc.index]) {
-          toolCallAccum[tc.index] = { id: "", name: "", args: "" };
-        }
-        const acc = toolCallAccum[tc.index];
-        if (tc.id) acc.id = tc.id;
-        if (tc.function?.name) acc.name = tc.function.name;
-        if (tc.function?.arguments) acc.args += tc.function.arguments;
-      }
-    }
-  }
-
-  // If the stream produced tool calls instead of text, handle them
-  if (hasToolCalls && Object.keys(toolCallAccum).length > 0) {
-    const toolCalls = Object.values(toolCallAccum);
-
-    // Build the assistant message with tool_calls for the conversation
-    const assistantMsg: ChatCompletionMessageParam = {
-      role: "assistant",
-      content: fullReply || null,
-      tool_calls: toolCalls.map((tc) => ({
-        id: tc.id,
-        type: "function" as const,
-        function: { name: tc.name, arguments: tc.args },
-      })),
-    };
-    messages.push(assistantMsg);
-
-    // Execute each tool call
-    for (const tc of toolCalls) {
-      const fn = toolHandlers[tc.name];
-      let result: string;
-      if (fn) {
-        const args = JSON.parse(tc.args);
-        result = await fn(args);
-      } else {
-        result = `Error: unknown tool "${tc.name}"`;
-      }
-      messages.push({
-        role: "tool",
-        tool_call_id: tc.id,
-        content: result,
-      });
-    }
-
-    // After handling tools, stream the next response (recursively, with depth limit via caller)
-    return fullReply;
   }
 
   return fullReply;
@@ -515,32 +456,51 @@ export default async function handler(
       { role: "user", content: message },
     ];
 
-    // Tool loop: handle up to MAX_TOOL_ITERATIONS rounds of tool calls
-    // before the final streamed text response
-    let finalReply = "";
-
+    // Tool loop: handle tool calls with non-streaming requests
+    // so intermediate text doesn't leak to the client
     for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-      const replyText = await streamFinalResponse(messages, res, true);
-      finalReply = replyText;
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages,
+        ...(tools.length > 0 && { tools }),
+      });
 
-      // Check if the last message in the conversation is a tool result
-      // (meaning streamFinalResponse handled tool calls and we need another round)
-      const lastMsg = messages[messages.length - 1];
-      if (lastMsg.role === "tool") {
-        // Tool calls were handled; loop to get the next response
-        continue;
+      const choice = completion.choices[0];
+      const assistantMessage = choice.message;
+
+      // No tool calls — this is the final text response, but we got it
+      // non-streaming. We'll re-do it as a streaming call below.
+      if (choice.finish_reason !== "tool_calls" || !assistantMessage.tool_calls?.length) {
+        break;
       }
 
-      // No tool calls — we're done streaming
-      break;
+      // Append the assistant message with tool calls to the conversation
+      messages.push(assistantMessage);
+
+      // Execute each tool call and append results
+      for (const toolCall of assistantMessage.tool_calls) {
+        if (toolCall.type !== "function") continue;
+
+        const fn = toolHandlers[toolCall.function.name];
+        let result: string;
+
+        if (fn) {
+          const args = JSON.parse(toolCall.function.arguments);
+          result = await fn(args);
+        } else {
+          result = `Error: unknown tool "${toolCall.function.name}"`;
+        }
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: result,
+        });
+      }
     }
 
-    // If we exhausted tool iterations and the last message is still a tool result,
-    // do one final streaming call without tools to force a text response
-    const lastMsg = messages[messages.length - 1];
-    if (lastMsg.role === "tool") {
-      finalReply = await streamFinalResponse(messages, res, false);
-    }
+    // Now stream the final text response (all tools are resolved)
+    const finalReply = await streamTextResponse(messages, res);
 
     // Send the done event with the full reply
     sendSSE(res, { done: true, reply: finalReply });

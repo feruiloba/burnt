@@ -125,6 +125,10 @@ export default function Home() {
       const reader = chatRes.body!.getReader();
       const decoder = new TextDecoder();
 
+      // Cancel the SSE reader when abort fires (e.g. on interrupt)
+      const onAbort = () => reader.cancel();
+      abortController.signal.addEventListener("abort", onAbort);
+
       let fullReply = "";
       let sentenceBuffer = "";
       let sseBuffer = "";
@@ -168,7 +172,7 @@ export default function Home() {
 
       // Read SSE stream
       try {
-        while (true) {
+        while (!abortController.signal.aborted) {
           const { done, value } = await reader.read();
           if (done) break;
 
@@ -194,7 +198,7 @@ export default function Home() {
               throw new Error(event.error);
             }
 
-            if (event.delta) {
+            if (event.delta && !abortController.signal.aborted) {
               fullReply += event.delta;
               sentenceBuffer += event.delta;
               onDelta?.(fullReply);
@@ -218,6 +222,7 @@ export default function Home() {
           }
         }
       } finally {
+        abortController.signal.removeEventListener("abort", onAbort);
         reader.releaseLock();
       }
 
@@ -268,7 +273,8 @@ export default function Home() {
       setMessages((prev) => [...prev, userMessage]);
 
       // Step 2: Stream chat response with sentence-level TTS
-      const currentHistory = [...messagesRef.current, userMessage];
+      // Send prior messages as history (the API appends the current message separately)
+      const currentHistory = messagesRef.current;
       const chatRes = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
