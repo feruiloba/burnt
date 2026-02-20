@@ -22,7 +22,6 @@ export default function Home() {
   const stateRef = useRef<AppState>("idle");
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number>(0);
@@ -79,7 +78,7 @@ export default function Home() {
           resolve();
           return;
         }
-        audio.play();
+        audio.play().catch(() => {});
       });
 
       audioRef.current = null;
@@ -117,7 +116,7 @@ export default function Home() {
    * Returns the full reply text.
    */
   const processStreamingResponse = useCallback(
-    async (chatRes: Response): Promise<string> => {
+    async (chatRes: Response, onDelta?: (text: string) => void): Promise<string> => {
       const abortController = new AbortController();
       ttsAbortRef.current = abortController;
       audioQueueRef.current = [];
@@ -149,6 +148,9 @@ export default function Home() {
           if (!res.ok) throw new Error("TTS failed");
           return res.blob();
         });
+
+        // Prevent unhandled rejection if abort happens before playback reaches this promise
+        ttsPromise.catch(() => {});
 
         // Chain playback: each segment waits for the previous one
         playbackFinished = playbackFinished.then(async () => {
@@ -195,6 +197,7 @@ export default function Home() {
             if (event.delta) {
               fullReply += event.delta;
               sentenceBuffer += event.delta;
+              onDelta?.(fullReply);
 
               // Check for sentence boundaries
               let match: RegExpExecArray | null;
@@ -224,8 +227,8 @@ export default function Home() {
         sentenceBuffer = "";
       }
 
-      // Wait for all audio segments to finish playing
-      await playbackFinished;
+      // Wait for all audio segments to finish playing (catch abort errors)
+      await playbackFinished.catch(() => {});
 
       ttsAbortRef.current = null;
       return fullReply;
@@ -234,6 +237,12 @@ export default function Home() {
   );
 
   const processAudio = useCallback(async (audioBlob: Blob) => {
+    // Skip blobs that are too small to be valid audio
+    if (audioBlob.size < 1000) {
+      if (activeRef.current) startListening();
+      return;
+    }
+
     setState("processing");
     setError(null);
 
@@ -274,13 +283,31 @@ export default function Home() {
         throw new Error(err.error || "Chat request failed");
       }
 
-      const reply = await processStreamingResponse(chatRes);
+      // Add an empty assistant message that we'll update as text streams in
+      let assistantAdded = false;
+      const reply = await processStreamingResponse(chatRes, (textSoFar) => {
+        if (!assistantAdded) {
+          assistantAdded = true;
+          setMessages((prev) => [...prev, { role: "assistant", content: textSoFar }]);
+        } else {
+          setMessages((prev) => {
+            const updated = [...prev];
+            updated[updated.length - 1] = { role: "assistant", content: textSoFar };
+            return updated;
+          });
+        }
+      });
 
-      const assistantMessage: Message = {
-        role: "assistant",
-        content: reply,
-      };
-      setMessages((prev) => [...prev, assistantMessage]);
+      // Final update with the complete reply text
+      if (assistantAdded) {
+        setMessages((prev) => {
+          const updated = [...prev];
+          updated[updated.length - 1] = { role: "assistant", content: reply };
+          return updated;
+        });
+      } else {
+        setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
+      }
 
       // If we weren't interrupted, resume normal listening
       if (activeRef.current && stateRef.current === "speaking") {
@@ -289,6 +316,12 @@ export default function Home() {
         setState("idle");
       }
     } catch (err: unknown) {
+      // Ignore abort errors — they're expected on interrupt/stop
+      if (err instanceof DOMException && err.name === "AbortError") {
+        if (activeRef.current) startListening();
+        else setState("idle");
+        return;
+      }
       const message =
         err instanceof Error ? err.message : "Something went wrong";
       setError(message);
@@ -361,18 +394,21 @@ export default function Home() {
     setState("listening");
     silenceStartRef.current = 0;
     recordingStartRef.current = 0;
-    chunksRef.current = [];
+
+    // Each recording session gets its own chunks array to prevent
+    // contamination from overlapping recorder stop/start events.
+    const chunks: Blob[] = [];
 
     const mediaRecorder = new MediaRecorder(stream);
     mediaRecorderRef.current = mediaRecorder;
 
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunksRef.current.push(e.data);
+      if (e.data.size > 0) chunks.push(e.data);
     };
 
     mediaRecorder.onstop = () => {
       if (!activeRef.current) return;
-      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      const blob = new Blob(chunks, { type: "audio/webm" });
       if (blob.size > 0) {
         processAudio(blob);
       } else if (activeRef.current) {
