@@ -370,28 +370,7 @@ const toolHandlers: Record<string, (args: Record<string, unknown>) => Promise<st
   reply_to_email: handleReplyToEmail,
 };
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse
-) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-
-  try {
-    const { message, history } = req.body as {
-      message: string;
-      history: { role: "user" | "assistant"; content: string }[];
-    };
-
-    if (!message) {
-      return res.status(400).json({ error: "No message provided" });
-    }
-
-    const messages: ChatCompletionMessageParam[] = [
-      {
-        role: "system",
-        content: `You are a personal email assistant with voice interface. You help the user manage and understand their email inbox.
+const SYSTEM_PROMPT = `You are a personal email assistant with voice interface. You help the user manage and understand their email inbox.
 
 Your capabilities:
 - Search emails by sender, subject, keywords, or date
@@ -413,65 +392,169 @@ Sending and replying to emails:
 - You MUST ask for explicit verbal confirmation (e.g. "Shall I send this?") and wait for the user to say "yes" before calling send_email or reply_to_email.
 - NEVER call send_email or reply_to_email without the user's confirmation first.
 - If the user says "no" or wants changes, adjust the draft and ask for confirmation again.
-- For replies, use search_emails and read_email first to find the message, then compose the reply.`,
-      },
+- For replies, use search_emails and read_email first to find the message, then compose the reply.`;
+
+function sendSSE(res: NextApiResponse, data: Record<string, unknown>) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+/**
+ * Stream the final text response from OpenAI as SSE delta events.
+ * Returns the full accumulated reply text.
+ */
+async function streamFinalResponse(
+  messages: ChatCompletionMessageParam[],
+  res: NextApiResponse,
+  includTools: boolean
+): Promise<string> {
+  const stream = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages,
+    ...(includTools && tools.length > 0 && { tools }),
+    stream: true,
+  });
+
+  let fullReply = "";
+  // Accumulate tool call deltas in case the model decides to call tools
+  const toolCallAccum: Record<number, { id: string; name: string; args: string }> = {};
+  let hasToolCalls = false;
+
+  for await (const chunk of stream) {
+    const delta = chunk.choices[0]?.delta;
+    if (!delta) continue;
+
+    // Text content delta
+    if (delta.content) {
+      fullReply += delta.content;
+      sendSSE(res, { delta: delta.content });
+    }
+
+    // Tool call deltas — accumulate them
+    if (delta.tool_calls) {
+      hasToolCalls = true;
+      for (const tc of delta.tool_calls) {
+        if (!toolCallAccum[tc.index]) {
+          toolCallAccum[tc.index] = { id: "", name: "", args: "" };
+        }
+        const acc = toolCallAccum[tc.index];
+        if (tc.id) acc.id = tc.id;
+        if (tc.function?.name) acc.name = tc.function.name;
+        if (tc.function?.arguments) acc.args += tc.function.arguments;
+      }
+    }
+  }
+
+  // If the stream produced tool calls instead of text, handle them
+  if (hasToolCalls && Object.keys(toolCallAccum).length > 0) {
+    const toolCalls = Object.values(toolCallAccum);
+
+    // Build the assistant message with tool_calls for the conversation
+    const assistantMsg: ChatCompletionMessageParam = {
+      role: "assistant",
+      content: fullReply || null,
+      tool_calls: toolCalls.map((tc) => ({
+        id: tc.id,
+        type: "function" as const,
+        function: { name: tc.name, arguments: tc.args },
+      })),
+    };
+    messages.push(assistantMsg);
+
+    // Execute each tool call
+    for (const tc of toolCalls) {
+      const fn = toolHandlers[tc.name];
+      let result: string;
+      if (fn) {
+        const args = JSON.parse(tc.args);
+        result = await fn(args);
+      } else {
+        result = `Error: unknown tool "${tc.name}"`;
+      }
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: result,
+      });
+    }
+
+    // After handling tools, stream the next response (recursively, with depth limit via caller)
+    return fullReply;
+  }
+
+  return fullReply;
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  try {
+    const { message, history } = req.body as {
+      message: string;
+      history: { role: "user" | "assistant"; content: string }[];
+    };
+
+    if (!message) {
+      return res.status(400).json({ error: "No message provided" });
+    }
+
+    // Set up SSE headers
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+
+    const messages: ChatCompletionMessageParam[] = [
+      { role: "system", content: SYSTEM_PROMPT },
       ...history,
       { role: "user", content: message },
     ];
 
+    // Tool loop: handle up to MAX_TOOL_ITERATIONS rounds of tool calls
+    // before the final streamed text response
+    let finalReply = "";
+
     for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages,
-        ...(tools.length > 0 && { tools }),
-      });
+      const replyText = await streamFinalResponse(messages, res, true);
+      finalReply = replyText;
 
-      const choice = completion.choices[0];
-      const assistantMessage = choice.message;
-
-      // If no tool calls, return the text response
-      if (choice.finish_reason !== "tool_calls" || !assistantMessage.tool_calls?.length) {
-        const reply = assistantMessage.content ?? "";
-        return res.status(200).json({ reply });
+      // Check if the last message in the conversation is a tool result
+      // (meaning streamFinalResponse handled tool calls and we need another round)
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg.role === "tool") {
+        // Tool calls were handled; loop to get the next response
+        continue;
       }
 
-      // Append the assistant message with tool calls to the conversation
-      messages.push(assistantMessage);
-
-      // Execute each tool call and append results
-      for (const toolCall of assistantMessage.tool_calls) {
-        if (toolCall.type !== "function") continue;
-
-        const fn = toolHandlers[toolCall.function.name];
-        let result: string;
-
-        if (fn) {
-          const args = JSON.parse(toolCall.function.arguments);
-          result = await fn(args);
-        } else {
-          result = `Error: unknown tool "${toolCall.function.name}"`;
-        }
-
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: result,
-        });
-      }
+      // No tool calls — we're done streaming
+      break;
     }
 
-    // If we hit the iteration cap, make one final call without tools to force a text response
-    const finalCompletion = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages,
-    });
+    // If we exhausted tool iterations and the last message is still a tool result,
+    // do one final streaming call without tools to force a text response
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg.role === "tool") {
+      finalReply = await streamFinalResponse(messages, res, false);
+    }
 
-    const reply = finalCompletion.choices[0]?.message?.content ?? "";
-    return res.status(200).json({ reply });
+    // Send the done event with the full reply
+    sendSSE(res, { done: true, reply: finalReply });
+    res.end();
   } catch (error: unknown) {
     console.error("[/api/chat] Error:", error);
     const message =
       error instanceof Error ? error.message : "Chat request failed";
-    return res.status(500).json({ error: message });
+    // If headers already sent, send error as SSE event
+    if (res.headersSent) {
+      sendSSE(res, { error: message });
+      res.end();
+    } else {
+      return res.status(500).json({ error: message });
+    }
   }
 }

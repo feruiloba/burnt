@@ -11,10 +11,6 @@ type Message = {
 const SILENCE_THRESHOLD = 0.02;
 const SILENCE_DURATION_MS = 1500;
 const MIN_RECORDING_MS = 500;
-const FIRST_INTERIM_DELAY_MS = 3000;
-const FIRST_INTERIM_MESSAGE = "Let me look into that, one moment.";
-const REPEAT_INTERIM_DELAY_MS = 5000;
-const REPEAT_INTERIM_MESSAGE = "Still working on it, hang tight.";
 
 export default function Home() {
   const [state, setState] = useState<AppState>("idle");
@@ -37,6 +33,9 @@ export default function Home() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const startListeningRef = useRef<() => void>(() => {});
   const startListeningForInterruptRef = useRef<() => void>(() => {});
+  const ttsAbortRef = useRef<AbortController | null>(null);
+  const audioQueueRef = useRef<Array<{ blob: Blob; text: string }>>([]);
+  const isPlayingQueueRef = useRef(false);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -50,23 +49,8 @@ export default function Home() {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const playTTS = useCallback(
-    async (text: string): Promise<void> => {
-      if (!activeRef.current) return;
-
-      const speakRes = await fetch("/api/speak", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-
-      if (!speakRes.ok) {
-        throw new Error("Speech synthesis failed");
-      }
-
-      if (!activeRef.current) return;
-
-      const blob = await speakRes.blob();
+  const playAudioBlob = useCallback(
+    async (blob: Blob): Promise<void> => {
       if (!activeRef.current) return;
 
       const url = URL.createObjectURL(blob);
@@ -103,6 +87,152 @@ export default function Home() {
     []
   );
 
+  const playTTS = useCallback(
+    async (text: string): Promise<void> => {
+      if (!activeRef.current) return;
+
+      const speakRes = await fetch("/api/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+
+      if (!speakRes.ok) {
+        throw new Error("Speech synthesis failed");
+      }
+
+      if (!activeRef.current) return;
+
+      const blob = await speakRes.blob();
+      if (!activeRef.current) return;
+
+      await playAudioBlob(blob);
+    },
+    [playAudioBlob]
+  );
+
+  /**
+   * Reads the SSE stream from /api/chat, splits text into sentences,
+   * fires TTS requests per sentence, and plays audio segments sequentially.
+   * Returns the full reply text.
+   */
+  const processStreamingResponse = useCallback(
+    async (chatRes: Response): Promise<string> => {
+      const abortController = new AbortController();
+      ttsAbortRef.current = abortController;
+      audioQueueRef.current = [];
+      isPlayingQueueRef.current = false;
+
+      const reader = chatRes.body!.getReader();
+      const decoder = new TextDecoder();
+
+      let fullReply = "";
+      let sentenceBuffer = "";
+      let sseBuffer = "";
+
+      // Sentence boundary regex: ends with . ! or ? followed by space or end
+      const sentenceEnd = /[.!?](?:\s|$)/;
+
+      // Promise that resolves when all queued audio has finished playing
+      let playbackFinished: Promise<void> = Promise.resolve();
+
+      const enqueueSentence = (sentence: string) => {
+        if (!sentence.trim() || !activeRef.current || abortController.signal.aborted) return;
+
+        // Fire TTS fetch immediately
+        const ttsPromise = fetch("/api/speak", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: sentence }),
+          signal: abortController.signal,
+        }).then((res) => {
+          if (!res.ok) throw new Error("TTS failed");
+          return res.blob();
+        });
+
+        // Chain playback: each segment waits for the previous one
+        playbackFinished = playbackFinished.then(async () => {
+          if (!activeRef.current || abortController.signal.aborted) return;
+          try {
+            const blob = await ttsPromise;
+            if (!activeRef.current || abortController.signal.aborted) return;
+            setState("speaking");
+            await playAudioBlob(blob);
+          } catch {
+            // Aborted or failed — skip
+          }
+        });
+      };
+
+      // Read SSE stream
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          sseBuffer += decoder.decode(value, { stream: true });
+
+          // Parse SSE events from buffer
+          const lines = sseBuffer.split("\n");
+          // Keep the last potentially incomplete line in the buffer
+          sseBuffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+
+            const jsonStr = line.slice(6);
+            let event: { delta?: string; done?: boolean; reply?: string; error?: string };
+            try {
+              event = JSON.parse(jsonStr);
+            } catch {
+              continue;
+            }
+
+            if (event.error) {
+              throw new Error(event.error);
+            }
+
+            if (event.delta) {
+              fullReply += event.delta;
+              sentenceBuffer += event.delta;
+
+              // Check for sentence boundaries
+              let match: RegExpExecArray | null;
+              while ((match = sentenceEnd.exec(sentenceBuffer)) !== null) {
+                const endIndex = match.index + match[0].length;
+                const sentence = sentenceBuffer.slice(0, endIndex).trim();
+                sentenceBuffer = sentenceBuffer.slice(endIndex);
+                enqueueSentence(sentence);
+              }
+            }
+
+            if (event.done) {
+              // Use the full reply from the done event if provided
+              if (event.reply) {
+                fullReply = event.reply;
+              }
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      // Flush any remaining text in the buffer as the last sentence
+      if (sentenceBuffer.trim()) {
+        enqueueSentence(sentenceBuffer.trim());
+        sentenceBuffer = "";
+      }
+
+      // Wait for all audio segments to finish playing
+      await playbackFinished;
+
+      ttsAbortRef.current = null;
+      return fullReply;
+    },
+    [playAudioBlob]
+  );
+
   const processAudio = useCallback(async (audioBlob: Blob) => {
     setState("processing");
     setError(null);
@@ -128,67 +258,29 @@ export default function Home() {
       const userMessage: Message = { role: "user", content: text };
       setMessages((prev) => [...prev, userMessage]);
 
-      // Step 2: Chat (with interim "hold on" messages if it takes too long)
+      // Step 2: Stream chat response with sentence-level TTS
       const currentHistory = [...messagesRef.current, userMessage];
-      const chatPromise = fetch("/api/chat", {
+      const chatRes = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, history: currentHistory }),
       });
 
-      let chatDone = false;
-      let chatRes: Response | null = null;
-
-      chatPromise.then((res) => {
-        chatDone = true;
-        chatRes = res;
-      });
-
-      // Wait for first interim threshold
-      if (!chatDone && activeRef.current) {
-        await Promise.race([
-          chatPromise,
-          new Promise<void>((r) => setTimeout(r, FIRST_INTERIM_DELAY_MS)),
-        ]);
-      }
-
-      // Play first interim if still waiting
-      if (!chatDone && activeRef.current) {
-        setState("speaking");
-        await playTTS(FIRST_INTERIM_MESSAGE);
-      }
-
-      // Keep playing repeat interim every 5s until chat responds
-      while (!chatDone && activeRef.current) {
-        await Promise.race([
-          chatPromise,
-          new Promise<void>((r) => setTimeout(r, REPEAT_INTERIM_DELAY_MS)),
-        ]);
-
-        if (!chatDone && activeRef.current) {
-          setState("speaking");
-          await playTTS(REPEAT_INTERIM_MESSAGE);
-        }
-      }
-
       if (!activeRef.current) return;
 
-      if (!chatRes!.ok) {
-        const err = await chatRes!.json();
+      if (!chatRes.ok) {
+        // Non-SSE error response
+        const err = await chatRes.json();
         throw new Error(err.error || "Chat request failed");
       }
 
-      const { reply } = await chatRes!.json();
+      const reply = await processStreamingResponse(chatRes);
+
       const assistantMessage: Message = {
         role: "assistant",
         content: reply,
       };
       setMessages((prev) => [...prev, assistantMessage]);
-
-      if (!activeRef.current) return;
-
-      setState("speaking");
-      await playTTS(reply);
 
       // If we weren't interrupted, resume normal listening
       if (activeRef.current && stateRef.current === "speaking") {
@@ -206,9 +298,16 @@ export default function Home() {
         setState("idle");
       }
     }
-  }, [playTTS]);
+  }, [playTTS, processStreamingResponse]);
 
   const stopAudioPlayback = useCallback(() => {
+    // Abort any pending TTS fetches
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
+    audioQueueRef.current = [];
+
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
@@ -369,6 +468,13 @@ export default function Home() {
   const stopSession = useCallback(() => {
     activeRef.current = false;
     cancelAnimationFrame(animFrameRef.current);
+
+    // Abort pending TTS fetches
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
+    audioQueueRef.current = [];
 
     if (mediaRecorderRef.current?.state === "recording") {
       mediaRecorderRef.current.stop();
