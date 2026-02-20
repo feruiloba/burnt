@@ -1,0 +1,30 @@
+{
+  "name": "voice-app",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@tailwindcss/postcss": "^4.2.0",
+    "@types/formidable": "^3.4.6",
+    "@types/node": "^25.3.0",
+    "@types/react": "^19.2.14",
+    "formidable": "^3.5.4",
+    "next": "^16.1.6",
+    "nylas": "^8.0.1",
+    "openai": "^6.22.0",
+    "pdf-parse": "^1.1.1",
+    "postcss": "^8.5.6",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "tailwindcss": "^4.2.0",
+    "typescript": "^5.9.3"
+  }
+}
