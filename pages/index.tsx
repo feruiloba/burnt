@@ -48,6 +48,24 @@ export default function Home() {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  const playConfirmBeep = useCallback(() => {
+    const ctx = audioContextRef.current;
+    if (!ctx) return;
+
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+
+    oscillator.type = "sine";
+    oscillator.frequency.value = 880;
+    gain.gain.value = 0.15;
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+
+    oscillator.start(ctx.currentTime);
+    oscillator.stop(ctx.currentTime + 0.15);
+  }, []);
+
   const playAudioBlob = useCallback(
     async (blob: Blob): Promise<void> => {
       if (!activeRef.current) return;
@@ -248,6 +266,7 @@ export default function Home() {
       return;
     }
 
+    playConfirmBeep();
     setState("processing");
     setError(null);
 
@@ -337,7 +356,7 @@ export default function Home() {
         setState("idle");
       }
     }
-  }, [playTTS, processStreamingResponse]);
+  }, [playTTS, processStreamingResponse, playConfirmBeep]);
 
   const stopAudioPlayback = useCallback(() => {
     // Abort any pending TTS fetches
