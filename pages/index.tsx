@@ -67,6 +67,8 @@ export default function Home() {
       if (!activeRef.current) return;
 
       const blob = await speakRes.blob();
+      if (!activeRef.current) return;
+
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audioRef.current = audio;
@@ -84,6 +86,15 @@ export default function Home() {
           URL.revokeObjectURL(url);
           resolve();
         };
+        audio.onpause = () => {
+          URL.revokeObjectURL(url);
+          resolve();
+        };
+        if (!activeRef.current) {
+          URL.revokeObjectURL(url);
+          resolve();
+          return;
+        }
         audio.play();
       });
 
@@ -261,6 +272,7 @@ export default function Home() {
     };
 
     mediaRecorder.onstop = () => {
+      if (!activeRef.current) return;
       const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       if (blob.size > 0) {
         processAudio(blob);
